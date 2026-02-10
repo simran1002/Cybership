@@ -1,694 +1,366 @@
-/**
- * Integration tests for UPS Carrier
- * Tests end-to-end logic with stubbed HTTP responses
- */
+import { createStubHttpClient, jsonResponse, textResponse } from '../helpers/stub-http-client';
+import { OAuthClient } from '../../infrastructure/auth/oauth-client';
+import { ClientCredentialsAuthProvider } from '../../infrastructure/auth/client-credentials-auth-provider';
+import { UpsRateClient } from '../../integrations/ups/ups-rate-client';
+import { UpsRateMapper } from '../../integrations/ups/ups-rate-mapper';
+import { UpsRateCarrier } from '../../integrations/ups/ups-rate-carrier';
+import { ErrorCode, NetworkError, RateLimitError, ServiceError, TimeoutError } from '../../domain/errors';
+import { RateRequest } from '../../domain/rates';
 
-import { UpsCarrier } from '../../carriers/ups/ups-carrier';
-import { TokenManager } from '../../auth/token-manager';
-import { HttpClient } from '../../http/client';
-import { RateRequest, Address, Package } from '../../types/domain';
-import { CarrierIntegrationError } from '../../types/errors';
-import { UpsRateResponse, UpsRateRequest } from '../../carriers/ups/types';
-import { UpsConfig } from '../../config';
+const upsConfig = {
+  clientId: 'test-client',
+  clientSecret: 'test-secret',
+  baseUrl: 'https://api.ups.com',
+  authUrl: 'https://auth.ups.com/token',
+  timeoutMs: 30000,
+  accountNumber: 'A1B2C3'
+};
 
-// Mock global fetch for OAuth token requests
-const mockFetch = jest.fn();
-global.fetch = mockFetch as jest.Mock;
+const validRequest: RateRequest = {
+  origin: {
+    street: ['123 Main St'],
+    city: 'Atlanta',
+    state: 'GA',
+    postalCode: '30339',
+    country: 'US'
+  },
+  destination: {
+    street: ['456 Oak Ave'],
+    city: 'Los Angeles',
+    state: 'CA',
+    postalCode: '90001',
+    country: 'US'
+  },
+  packages: [{ weight: 5, length: 10, width: 8, height: 6 }]
+};
 
-// Mock HTTP client for testing
-class MockHttpClient implements HttpClient {
-  private responses: Map<string, unknown> = new Map();
-  private requests: Array<{ url: string; body: unknown; headers?: Record<string, string> }> = [];
+type UpsRateRequestPayload = {
+  RateRequest: {
+    Request: { RequestOption: string };
+    Shipment: {
+      Shipper: { ShipperNumber?: string; Address: { City: string } };
+      ShipTo: { Address: { City: string } };
+      Package: Array<{ Weight: { Value: string } }>;
+      Service?: { Code: string };
+    };
+  };
+};
 
-  setResponse(url: string, response: unknown): void {
-    this.responses.set(url, response);
-  }
-
-  getRequests(): Array<{ url: string; body: unknown; headers?: Record<string, string> }> {
-    return this.requests;
-  }
-
-  async post<T>(url: string, body: unknown, headers?: Record<string, string>): Promise<T> {
-    this.requests.push({ url, body, headers });
-    const response = this.responses.get(url);
-    if (!response) {
-      throw new Error(`No mock response set for ${url}`);
-    }
-    return response as T;
-  }
-
-  async get<T>(url: string, headers?: Record<string, string>): Promise<T> {
-    this.requests.push({ url, body: null, headers });
-    const response = this.responses.get(url);
-    if (!response) {
-      throw new Error(`No mock response set for ${url}`);
-    }
-    return response as T;
-  }
+function futureDate(daysFromNow: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + daysFromNow);
+  return d.toISOString().slice(0, 10);
 }
 
-describe('UPS Carrier Integration Tests', () => {
-  let mockHttpClient: MockHttpClient;
-  let tokenManager: TokenManager;
-  let upsCarrier: UpsCarrier;
-  let config: UpsConfig;
-
-  const sampleAddress: Address = {
-    street: ['123 Main St'],
-    city: 'New York',
-    state: 'NY',
-    postalCode: '10001',
-    country: 'US'
+function rateSuccessResponse() {
+  return {
+    RateResponse: {
+      Response: {
+        ResponseStatus: { Code: '1', Description: 'Success' }
+      },
+      RatedShipment: [
+        {
+          Service: { Code: '03', Description: 'UPS Ground' },
+          TotalCharges: { CurrencyCode: 'USD', MonetaryValue: '18.42' },
+          GuaranteedDelivery: { Date: futureDate(5) }
+        },
+        {
+          Service: { Code: '01', Description: 'UPS Next Day Air' },
+          TotalCharges: { CurrencyCode: 'USD', MonetaryValue: '89.50' },
+          GuaranteedDelivery: { Date: futureDate(1) }
+        }
+      ]
+    }
   };
+}
 
-  const samplePackage: Package = {
-    weight: 5,
-    length: 10,
-    width: 8,
-    height: 6
+function rateErrorStatusResponse() {
+  return {
+    RateResponse: {
+      Response: {
+        ResponseStatus: { Code: '0', Description: 'Failure' },
+        Alert: [{ Code: '123', Description: 'Invalid address' }]
+      }
+    }
   };
+}
 
-  beforeEach(() => {
-    mockHttpClient = new MockHttpClient();
-    mockFetch.mockClear();
-    config = {
-      clientId: 'test_client_id',
-      clientSecret: 'test_client_secret',
-      baseUrl: 'https://onlinetools.ups.com',
-      authUrl: 'https://onlinetools.ups.com/security/v1/oauth/token',
-      timeout: 30000
-    };
-    tokenManager = new TokenManager(
-      mockHttpClient,
-      config.authUrl,
-      config.clientId,
-      config.clientSecret
-    );
-    upsCarrier = new UpsCarrier(mockHttpClient, tokenManager, config);
+function buildCarrier(httpHandler: Parameters<typeof createStubHttpClient>[0]) {
+  const httpClient = createStubHttpClient(httpHandler);
+  const oauthClient = new OAuthClient(httpClient, {
+    authUrl: upsConfig.authUrl,
+    clientId: upsConfig.clientId,
+    clientSecret: upsConfig.clientSecret,
+    timeoutMs: upsConfig.timeoutMs
+  });
+  const authProvider = new ClientCredentialsAuthProvider(oauthClient);
+  const rateClient = new UpsRateClient(httpClient, authProvider, upsConfig);
+  const mapper = new UpsRateMapper({ accountNumber: upsConfig.accountNumber });
+  const carrier = new UpsRateCarrier(rateClient, mapper);
+  return { httpClient, carrier };
+}
+
+describe('UpsRateCarrier (UPS Rating)', () => {
+  it('exposes carrier name and supported service levels', () => {
+    const { carrier } = buildCarrier(async (req) => {
+      if (req.url === upsConfig.authUrl) {
+        return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
+      }
+      return jsonResponse(200, rateSuccessResponse());
+    });
+
+    expect(carrier.getName()).toBe('UPS');
+    expect(carrier.supportsServiceLevel('ground')).toBe(true);
+    expect(carrier.supportsServiceLevel('nextDayAir')).toBe(true);
   });
 
-  describe('Authentication', () => {
-    it('should acquire and cache access token', async () => {
-      const tokenResponse = {
-        access_token: 'test_access_token_123',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
-      });
-
-      const token = await tokenManager.getAccessToken();
-      expect(token).toBe('test_access_token_123');
-
-      // Verify fetch was called with correct OAuth parameters
-      expect(mockFetch).toHaveBeenCalledWith(
-        config.authUrl,
-        expect.objectContaining({
-          method: 'POST',
-          headers: expect.objectContaining({
-            'Authorization': expect.stringContaining('Basic'),
-            'Content-Type': 'application/x-www-form-urlencoded'
-          })
-        })
-      );
-    });
-
-    it('should reuse cached token when valid', async () => {
-      const tokenResponse = {
-        access_token: 'test_access_token_123',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      mockFetch.mockResolvedValue({
-        ok: true,
-        json: async () => tokenResponse
-      });
-
-      // First call
-      const token1 = await tokenManager.getAccessToken();
-      expect(token1).toBe('test_access_token_123');
-
-      // Second call should reuse cached token
-      const token2 = await tokenManager.getAccessToken();
-      expect(token2).toBe('test_access_token_123');
-
-      // Should only have made one auth request
-      expect(mockFetch).toHaveBeenCalledTimes(1);
-    });
-
-    it('should refresh token when expired', async () => {
-      const tokenResponse1 = {
-        access_token: 'token_1',
-        token_type: 'Bearer',
-        expires_in: 1 // Very short expiration
-      };
-
-      const tokenResponse2 = {
-        access_token: 'token_2',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      mockFetch
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => tokenResponse1
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => tokenResponse2
-        });
-
-      await tokenManager.getAccessToken();
-
-      // Wait for token to expire
-      await new Promise(resolve => setTimeout(resolve, 1100));
-
-      const newToken = await tokenManager.getAccessToken();
-      expect(newToken).toBe('token_2');
-      expect(mockFetch).toHaveBeenCalledTimes(2);
-    });
-
-    it('should handle auth failures', async () => {
-      mockFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 401,
-        text: async () => 'Unauthorized'
-      });
-
-      await expect(tokenManager.getAccessToken()).rejects.toThrow(CarrierIntegrationError);
-    });
-  });
-
-  describe('Rate Request Building', () => {
-    it('should build correct UPS request for single package', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      const upsRateResponse: UpsRateResponse = {
-        RateResponse: {
-          Response: {
-            ResponseStatus: {
-              Code: '1',
-              Description: 'Success'
-            }
-          },
-          RatedShipment: [{
-            Service: {
-              Code: '03',
-              Description: 'UPS Ground'
-            },
-            TotalCharges: {
-              CurrencyCode: 'USD',
-              MonetaryValue: '15.50'
-            }
-          }]
+  describe('request building', () => {
+    it('builds a correct UPS payload and includes auth + request id headers', async () => {
+      const { httpClient, carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', token_type: 'Bearer', expires_in: 3600 });
         }
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
+        return jsonResponse(200, rateSuccessResponse());
       });
-      mockHttpClient.setResponse(`${config.baseUrl}/api/rating/v1/Rate`, upsRateResponse);
 
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage]
-      };
+      const result = await carrier.getRates(validRequest);
+      const requests = httpClient.getRequests();
 
-      await upsCarrier.getRates(request);
+      const rateReq = requests.find((r) => r.url.includes('/api/rating/v1/Rate'));
+      expect(rateReq).toBeDefined();
+      expect(rateReq!.headers?.['Authorization']).toBe('Bearer token_1');
+      expect(rateReq!.headers?.['transId']).toBe(result.requestId);
 
-      const requests = mockHttpClient.getRequests();
-      const rateRequest = requests.find(r => r.url.includes('/api/rating/v1/Rate'));
-      
-      expect(rateRequest).toBeDefined();
-      const body = rateRequest!.body as UpsRateRequest;
-      
-      expect(body.RateRequest.Shipment.Shipper.Address.City).toBe('New York');
-      expect(body.RateRequest.Shipment.ShipTo.Address.City).toBe('New York');
-      expect(body.RateRequest.Shipment.Package).toHaveLength(1);
-      expect(body.RateRequest.Shipment.Package[0].Weight.Value).toBe('5');
-      expect(body.RateRequest.Shipment.Package[0].Dimensions?.Length).toBe('10');
-    });
-
-    it('should include service code when service level specified', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      const upsRateResponse: UpsRateResponse = {
-        RateResponse: {
-          Response: {
-            ResponseStatus: {
-              Code: '1',
-              Description: 'Success'
-            }
-          },
-          RatedShipment: [{
-            Service: {
-              Code: '01',
-              Description: 'UPS Next Day Air'
-            },
-            TotalCharges: {
-              CurrencyCode: 'USD',
-              MonetaryValue: '45.00'
-            }
-          }]
-        }
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
-      });
-      mockHttpClient.setResponse(`${config.baseUrl}/api/rating/v1/Rate`, upsRateResponse);
-
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage],
-        serviceLevel: 'nextDayAir'
-      };
-
-      await upsCarrier.getRates(request);
-
-      const requests = mockHttpClient.getRequests();
-      const rateRequest = requests.find(r => r.url.includes('/api/rating/v1/Rate'));
-      const body = rateRequest!.body as UpsRateRequest;
-      
-      expect(body.RateRequest.Shipment.Service?.Code).toBe('01');
-      expect(body.RateRequest.Request.RequestOption).toBe('Rate');
-    });
-
-    it('should use Shop option when no service level specified', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      const upsRateResponse: UpsRateResponse = {
-        RateResponse: {
-          Response: {
-            ResponseStatus: {
-              Code: '1',
-              Description: 'Success'
-            }
-          },
-          RatedShipment: [{
-            Service: {
-              Code: '03',
-              Description: 'UPS Ground'
-            },
-            TotalCharges: {
-              CurrencyCode: 'USD',
-              MonetaryValue: '15.50'
-            }
-          }]
-        }
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
-      });
-      mockHttpClient.setResponse(`${config.baseUrl}/api/rating/v1/Rate`, upsRateResponse);
-
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage]
-      };
-
-      await upsCarrier.getRates(request);
-
-      const requests = mockHttpClient.getRequests();
-      const rateRequest = requests.find(r => r.url.includes('/api/rating/v1/Rate'));
-      const body = rateRequest!.body as UpsRateRequest;
-      
+      const body = JSON.parse(rateReq!.body ?? '{}') as UpsRateRequestPayload;
       expect(body.RateRequest.Request.RequestOption).toBe('Shop');
+      expect(body.RateRequest.Shipment.Shipper.ShipperNumber).toBe(upsConfig.accountNumber);
+      expect(body.RateRequest.Shipment.Shipper.Address.City).toBe('Atlanta');
+      expect(body.RateRequest.Shipment.ShipTo.Address.City).toBe('Los Angeles');
+      expect(body.RateRequest.Shipment.Package).toHaveLength(1);
+      expect(body.RateRequest.Shipment.Package[0]!.Weight.Value).toBe('5');
+    });
+
+    it('uses Rate + service code when a service level is requested', async () => {
+      const { httpClient, carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
+        }
+        return jsonResponse(200, rateSuccessResponse());
+      });
+
+      await carrier.getRates({ ...validRequest, serviceLevel: 'ground' });
+      const rateReq = httpClient.getRequests().find((r) => r.url.includes('/api/rating/v1/Rate'))!;
+      const body = JSON.parse(rateReq.body ?? '{}') as UpsRateRequestPayload;
+      expect(body.RateRequest.Request.RequestOption).toBe('Rate');
+      expect(body.RateRequest.Shipment.Service?.Code).toBe('03');
     });
   });
 
-  describe('Response Parsing', () => {
-    it('should parse successful response with single rate', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      const upsRateResponse: UpsRateResponse = {
-        RateResponse: {
-          Response: {
-            ResponseStatus: {
-              Code: '1',
-              Description: 'Success'
-            }
-          },
-          RatedShipment: [{
-            Service: {
-              Code: '03',
-              Description: 'UPS Ground'
-            },
-            TotalCharges: {
-              CurrencyCode: 'USD',
-              MonetaryValue: '15.50'
-            },
-            GuaranteedDelivery: {
-              Date: '2026-02-10'
-            }
-          }]
+  describe('response parsing', () => {
+    it('normalizes UPS response into RateResponse', async () => {
+      const { carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
         }
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
+        return jsonResponse(200, rateSuccessResponse());
       });
-      mockHttpClient.setResponse(`${config.baseUrl}/api/rating/v1/Rate`, upsRateResponse);
 
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage]
-      };
+      const result = await carrier.getRates(validRequest);
+      expect(result.quotes).toHaveLength(2);
+      expect(result.requestId).toMatch(/^req_\d+_/);
 
-      const response = await upsCarrier.getRates(request);
-
-      expect(response.quotes).toHaveLength(1);
-      expect(response.quotes[0].serviceLevel).toBe('ground');
-      expect(response.quotes[0].serviceName).toBe('UPS Ground');
-      expect(response.quotes[0].totalCost).toBe(15.50);
-      expect(response.quotes[0].currency).toBe('USD');
-      expect(response.quotes[0].carrier).toBe('UPS');
-      expect(response.quotes[0].estimatedDays).toBeDefined();
+      const ground = result.quotes.find((q) => q.serviceLevel === 'ground');
+      expect(ground?.totalCost).toBe(18.42);
+      expect(ground?.currency).toBe('USD');
+      expect(ground?.carrier).toBe('UPS');
+      expect(ground?.estimatedDays).toBeGreaterThan(0);
     });
 
-    it('should parse response with multiple rates', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      const upsRateResponse: UpsRateResponse = {
+    it('prefers negotiated rates when present', async () => {
+      const negotiated = {
         RateResponse: {
-          Response: {
-            ResponseStatus: {
-              Code: '1',
-              Description: 'Success'
-            }
-          },
+          Response: { ResponseStatus: { Code: '1', Description: 'Success' } },
           RatedShipment: [
             {
-              Service: {
-                Code: '03',
-                Description: 'UPS Ground'
-              },
-              TotalCharges: {
-                CurrencyCode: 'USD',
-                MonetaryValue: '15.50'
-              }
-            },
-            {
-              Service: {
-                Code: '01',
-                Description: 'UPS Next Day Air'
-              },
-              TotalCharges: {
-                CurrencyCode: 'USD',
-                MonetaryValue: '45.00'
+              Service: { Code: '03', Description: 'UPS Ground' },
+              TotalCharges: { CurrencyCode: 'USD', MonetaryValue: '25.00' },
+              NegotiatedRateCharges: {
+                TotalCharge: { CurrencyCode: 'USD', MonetaryValue: '18.00' }
               }
             }
           ]
         }
       };
 
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
-      });
-      mockHttpClient.setResponse(`${config.baseUrl}/api/rating/v1/Rate`, upsRateResponse);
-
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage]
-      };
-
-      const response = await upsCarrier.getRates(request);
-
-      expect(response.quotes).toHaveLength(2);
-      expect(response.quotes[0].serviceLevel).toBe('ground');
-      expect(response.quotes[1].serviceLevel).toBe('nextDayAir');
-    });
-
-    it('should prefer negotiated rates when available', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      const upsRateResponse: UpsRateResponse = {
-        RateResponse: {
-          Response: {
-            ResponseStatus: {
-              Code: '1',
-              Description: 'Success'
-            }
-          },
-          RatedShipment: [{
-            Service: {
-              Code: '03',
-              Description: 'UPS Ground'
-            },
-            TotalCharges: {
-              CurrencyCode: 'USD',
-              MonetaryValue: '15.50'
-            },
-            NegotiatedRateCharges: {
-              TotalCharge: {
-                CurrencyCode: 'USD',
-                MonetaryValue: '12.00'
-              }
-            }
-          }]
+      const { carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
         }
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
+        return jsonResponse(200, negotiated);
       });
-      mockHttpClient.setResponse(`${config.baseUrl}/api/rating/v1/Rate`, upsRateResponse);
 
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage]
-      };
-
-      const response = await upsCarrier.getRates(request);
-
-      expect(response.quotes[0].totalCost).toBe(12.00); // Should use negotiated rate
+      const result = await carrier.getRates(validRequest);
+      expect(result.quotes).toHaveLength(1);
+      expect(result.quotes[0]!.totalCost).toBe(18);
     });
   });
 
-  describe('Error Handling', () => {
-    it('should handle API error responses', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
+  describe('auth lifecycle (401 retry)', () => {
+    it('refreshes the token and retries once on 401', async () => {
+      let tokenCalls = 0;
+      let rateCalls = 0;
 
-      const upsRateResponse: UpsRateResponse = {
-        RateResponse: {
-          Response: {
-            ResponseStatus: {
-              Code: '0',
-              Description: 'Failure'
-            },
-            Alert: [{
-              Code: '110537',
-              Description: 'The postal code 12345 is invalid for the country US.'
-            }]
-          }
+      const { httpClient, carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          tokenCalls += 1;
+          return jsonResponse(200, { access_token: tokenCalls === 1 ? 'token_1' : 'token_2', expires_in: 3600 });
         }
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
+        rateCalls += 1;
+        if (rateCalls === 1) return textResponse(401, 'Unauthorized');
+        return jsonResponse(200, rateSuccessResponse());
       });
-      mockHttpClient.setResponse(`${config.baseUrl}/api/rating/v1/Rate`, upsRateResponse);
 
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage]
-      };
+      const result = await carrier.getRates(validRequest);
+      expect(result.quotes).toHaveLength(2);
+      expect(tokenCalls).toBe(2);
+      expect(rateCalls).toBe(2);
 
-      await expect(upsCarrier.getRates(request)).rejects.toThrow(CarrierIntegrationError);
+      const rateRequests = httpClient.getRequests().filter((r) => r.url.includes('/api/rating/v1/Rate'));
+      expect(rateRequests).toHaveLength(2);
+      expect(rateRequests[0]!.headers?.['Authorization']).toBe('Bearer token_1');
+      expect(rateRequests[1]!.headers?.['Authorization']).toBe('Bearer token_2');
     });
 
-    it('should handle HTTP 401 errors', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
-      });
-      
-      mockHttpClient.post = jest.fn().mockImplementation(async (url: string, _body?: unknown) => {
-        if (url.includes('/api/rating/v1/Rate')) {
-          throw new Error('HTTP 401: Unauthorized');
+    it('throws AUTH_TOKEN_INVALID after a second 401', async () => {
+      const { carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
         }
-        throw new Error(`No mock response set for ${url}`);
+        return textResponse(401, 'Unauthorized');
       });
 
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage]
-      };
+      await expect(carrier.getRates(validRequest)).rejects.toMatchObject({
+        code: ErrorCode.AUTH_TOKEN_INVALID,
+        carrier: 'UPS'
+      });
+    });
+  });
 
-      await expect(upsCarrier.getRates(request)).rejects.toThrow(CarrierIntegrationError);
+  describe('error handling', () => {
+    it('throws API_ERROR when UPS returns failure status in body', async () => {
+      const { carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
+        }
+        return jsonResponse(200, rateErrorStatusResponse());
+      });
+
+      await expect(carrier.getRates(validRequest)).rejects.toMatchObject({
+        code: ErrorCode.API_ERROR,
+        carrier: 'UPS'
+      });
     });
 
-    it('should handle HTTP 429 rate limiting', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
-      });
-      
-      mockHttpClient.post = jest.fn().mockImplementation(async (url: string, _body?: unknown) => {
-        if (url.includes('/api/rating/v1/Rate')) {
-          throw new Error('HTTP 429: Too Many Requests');
+    it('throws RateLimitError on 429', async () => {
+      const { carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
         }
-        throw new Error(`No mock response set for ${url}`);
+        return textResponse(429, 'Too Many Requests');
       });
 
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage]
-      };
-
-      await expect(upsCarrier.getRates(request)).rejects.toThrow(CarrierIntegrationError);
+      await expect(carrier.getRates(validRequest)).rejects.toBeInstanceOf(RateLimitError);
     });
 
-    it('should handle timeout errors', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
-      });
-      
-      mockHttpClient.post = jest.fn().mockImplementation(async (url: string, _body?: unknown) => {
-        if (url.includes('/api/rating/v1/Rate')) {
-          throw new Error('Request timeout after 30000ms');
+    it('throws retryable API_ERROR on 5xx', async () => {
+      const { carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
         }
-        throw new Error(`No mock response set for ${url}`);
+        return textResponse(503, 'Service Unavailable');
       });
 
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage]
-      };
-
-      await expect(upsCarrier.getRates(request)).rejects.toThrow(CarrierIntegrationError);
+      await expect(carrier.getRates(validRequest)).rejects.toMatchObject({
+        code: ErrorCode.API_ERROR,
+        carrier: 'UPS',
+        retryable: true
+      });
     });
 
-    it('should handle malformed JSON responses', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
-      });
-      
-      mockHttpClient.post = jest.fn().mockImplementation(async (url: string, _body?: unknown) => {
-        if (url.includes('/api/rating/v1/Rate')) {
-          throw new Error('Invalid JSON response');
+    it('throws non-retryable API_ERROR on other non-2xx responses', async () => {
+      const { carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
         }
-        throw new Error(`No mock response set for ${url}`);
+        return textResponse(400, 'Bad Request');
       });
 
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage]
-      };
-
-      await expect(upsCarrier.getRates(request)).rejects.toThrow(CarrierIntegrationError);
+      await expect(carrier.getRates(validRequest)).rejects.toMatchObject({
+        code: ErrorCode.API_ERROR,
+        carrier: 'UPS',
+        retryable: false
+      });
     });
 
-    it('should handle empty rate responses', async () => {
-      const tokenResponse = {
-        access_token: 'test_token',
-        token_type: 'Bearer',
-        expires_in: 3600
-      };
-
-      const upsRateResponse: UpsRateResponse = {
-        RateResponse: {
-          Response: {
-            ResponseStatus: {
-              Code: '1',
-              Description: 'Success'
-            }
-          },
-          RatedShipment: []
+    it('throws MALFORMED_RESPONSE on invalid JSON', async () => {
+      const { carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
         }
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => tokenResponse
+        return textResponse(200, '<html>not json</html>');
       });
-      mockHttpClient.setResponse(`${config.baseUrl}/api/rating/v1/Rate`, upsRateResponse);
 
-      const request: RateRequest = {
-        origin: sampleAddress,
-        destination: sampleAddress,
-        packages: [samplePackage]
-      };
+      await expect(carrier.getRates(validRequest)).rejects.toMatchObject({
+        code: ErrorCode.MALFORMED_RESPONSE,
+        carrier: 'UPS'
+      });
+    });
 
-      await expect(upsCarrier.getRates(request)).rejects.toThrow(CarrierIntegrationError);
+    it('attaches carrier context to network errors', async () => {
+      const { carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
+        }
+        throw new NetworkError('socket hang up');
+      });
+
+      await expect(carrier.getRates(validRequest)).rejects.toMatchObject({
+        code: ErrorCode.NETWORK_ERROR,
+        carrier: 'UPS'
+      });
+    });
+
+    it('wraps unexpected non-ServiceError failures as UNKNOWN_ERROR', async () => {
+      const { carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
+        }
+        throw new Error('boom');
+      });
+
+      await expect(carrier.getRates(validRequest)).rejects.toMatchObject({
+        code: ErrorCode.UNKNOWN_ERROR,
+        carrier: 'UPS'
+      });
+    });
+
+    it('attaches carrier context to timeout errors', async () => {
+      const { carrier } = buildCarrier(async (req) => {
+        if (req.url === upsConfig.authUrl) {
+          return jsonResponse(200, { access_token: 'token_1', expires_in: 3600 });
+        }
+        throw new TimeoutError('Request timeout after 30000ms');
+      });
+
+      try {
+        await carrier.getRates(validRequest);
+        throw new Error('expected to throw');
+      } catch (e) {
+        expect(e).toBeInstanceOf(ServiceError);
+        const err = e as ServiceError;
+        expect(err.code).toBe(ErrorCode.TIMEOUT);
+        expect(err.carrier).toBe('UPS');
+      }
     });
   });
 });
