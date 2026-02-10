@@ -122,7 +122,3 @@ npm run test:coverage
 docker build -t cybership-carrier-integration .
 docker run --rm cybership-carrier-integration
 ```
-
-## License
-
-MIT
